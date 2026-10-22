@@ -332,6 +332,12 @@ class SystemTtsService : TextToSpeechService(), IEventDispatcher {
         val enabledBgm = request.params.getBoolean(PARAM_BGM_ENABLED, true)
         mTtsManager?.context?.cfg?.bgmEnabled = { enabledBgm }
 
+        // 标记系统 TTS 音频回调是否已初始化：onSynthesizeStart 触发即置位（含 DirectPlay 等
+        // 不一定向系统 TTS 写入 PCM 的情况），用于保证 callback.done() 只在 start() 之后调用。
+        // fix: 不得在从未 start() 的情况下直接调用 callback.done()，
+        // 否则框架 FileSynthesisCallback.done() 会用 audioFormat=0(ENCODING_INVALID)
+        // 生成 WAV 头，抛出 IllegalArgumentException("Bad audio format 0") 导致闪退。
+        var started = false
         runBlocking {
              // If the voiceName is not empty, get the configuration ID from the voiceName.
             var cfgId: Long? = getConfigIdFromVoiceName(request.voiceName ?: "").onFailure {
@@ -347,6 +353,7 @@ class SystemTtsService : TextToSpeechService(), IEventDispatcher {
                     callback = object :
                         com.github.jing332.tts.synthesizer.SynthesisCallback {
                         override fun onSynthesizeStart(sampleRate: Int) {
+                            started = true
                             callback.start(
                                 /* sampleRateInHz = */ sampleRate,
                                 /* audioFormat = */ AudioFormat.ENCODING_PCM_16BIT,
@@ -361,17 +368,30 @@ class SystemTtsService : TextToSpeechService(), IEventDispatcher {
                     }
                 )?.onSuccess {
                     logger.debug { "done" }
-                    callback.done()
+                    if (started) {
+                        callback.done()
+                    } else {
+                        // onSynthesizeStart 从未触发（文本全为静音字符、请求全部失败等），
+                        // error() 后的 done() 会被框架安全地转为 onError 通知调用方。
+                        logE("Synthesis completed without producing any audio")
+                        callback.error(TextToSpeech.ERROR_SYNTHESIS)
+                        callback.done()
+                    }
                 }?.onFailure {
+                    // 统一收尾：error() 后必须补 done()。
+                    // 若错误发生在 start() 之前，框架 hasStarted() 兜底不会生效，
+                    // 文件合成（synthesizeToFile）调用方将收不到任何结束回调而一直等待。
                     when (it) {
                         SynthesisError.ConfigEmpty -> {
                             callback.error(TextToSpeech.ERROR_SYNTHESIS)
+                            callback.done()
                         }
 
                         is SynthesisError.TextHandle -> {
                             // eventListener already handled
                             // handleTextProcessorError(it.err)
                             callback.error(TextToSpeech.ERROR_SYNTHESIS)
+                            callback.done()
                             awaitCancellation()
                         }
 
@@ -379,9 +399,9 @@ class SystemTtsService : TextToSpeechService(), IEventDispatcher {
                             logE(R.string.tts_config_not_exist)
                             longToast(R.string.tts_config_not_exist)
                             callback.error(TextToSpeech.ERROR_INVALID_REQUEST)
+                            callback.done()
                         }
                     }
-//                    callback.done()
                 }
             }
 
