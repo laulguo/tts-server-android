@@ -10,6 +10,8 @@ on:
 
 jobs:
   build:
+    # 防止构建异常时无限挂起 (GitHub 默认最长 6 小时)
+    timeout-minutes: 60
     strategy:
       matrix:
         product: [ { name: "App原版", value: app } ]
